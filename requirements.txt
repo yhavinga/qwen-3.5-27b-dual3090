@@ -1,0 +1,12 @@
+# Qwen 3.5 27B Inference Stack
+# Install with: pip install -r requirements.txt
+
+# vLLM - main inference engine
+# IMPORTANT: Use 0.17.1, NOT 0.18.0 (torch.compile bug with PyTorch 2.10)
+vllm==0.17.1
+
+# HTTP client for benchmarks
+requests>=2.28.0
+
+# Optional: for advanced metrics
+# prometheus-client>=0.19.0

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# vLLM source (editable install, too large)
+vllm-source/
+
+# Results and outputs
+results/
+*.json
+!scales/*.json.template
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Scales (generated per-model)
+scales/*.json
+
+# Logs
+*.log

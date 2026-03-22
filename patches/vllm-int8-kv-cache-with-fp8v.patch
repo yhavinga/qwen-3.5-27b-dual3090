@@ -1,0 +1,286 @@
+# INT8-K + FP8-V KV Cache Patch for vLLM 0.17.1
+#
+# Enables quantized KV cache for Ampere GPUs (RTX 3090) that lack FP8 hardware:
+# - K (keys): INT8 symmetric quantization (stable, 5.8x range)
+# - V (values): FP8-E4M3 emulated in INT8 storage (handles 340x range)
+#
+# Both use per-layer scales for optimal precision.
+#
+# Apply to your vLLM installation:
+#   patch -p1 -d $(python -c "import vllm; print(vllm.__path__[0])") < patches/vllm-int8-kv-cache-with-fp8v.patch
+#
+# Enable FP8-V emulation at runtime:
+#   export VLLM_INT8_V_FP8_EMUL=1
+#
+# Without the env var, both K and V use INT8 (simpler, still good quality).
+
+--- a/config/cache.py
++++ b/config/cache.py
+@@ -23,6 +23,7 @@ CacheDType = Literal[
+     "fp8_e4m3",
+     "fp8_e5m2",
+     "fp8_inc",
+     "fp8_ds_mla",
++    "int8",  # INT8 KV cache for Ampere GPUs (RTX 3090)
+ ]
+
+--- a/v1/attention/backend.py
++++ b/v1/attention/backend.py
+@@ -922,7 +922,7 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
+     """Check if the KV cache dtype is quantized (FP8 or INT8).
+     Used by attention backends to determine if dequantization is needed.
+     """
+-    return kv_cache_dtype.startswith("fp8")
++    return kv_cache_dtype.startswith("fp8") or kv_cache_dtype == "int8"
+
+--- a/v1/attention/backends/triton_attn.py
++++ b/v1/attention/backends/triton_attn.py
+@@ -264,6 +264,7 @@ class TritonFlashAttentionBackend(AttentionBackend):
+         "fp8",
+         "fp8_e4m3",
+         "fp8_e5m2",
++        "int8",  # INT8 KV cache for Ampere GPUs
+     ]
+
+--- a/v1/attention/ops/triton_reshape_and_cache_flash.py
++++ b/v1/attention/ops/triton_reshape_and_cache_flash.py
+@@ -1,10 +1,55 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+ import torch
++import os
+
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+
+
++@triton.jit
++def _fp8_e4m3_encode_to_int8(x):
++    """Encode normalized float32 values to emulated FP8 E4M3 byte codes in int8.
++
++    FP8-E4M3 format: 1 sign + 4 exponent + 3 mantissa bits
++    Range: [-448, 448] with logarithmic precision spacing
++
++    This handles the 340x variance in V activations better than linear INT8.
++    """
++    x = x.to(tl.float32)
++    ax = tl.abs(x)
++    sign = x < 0
++    is_zero = ax < 1e-7
++    is_normal = ax >= 0.015625  # 2^-6
++
++    # Normal number encoding
++    exp_q = tl.floor(tl.log2(tl.maximum(ax, 1e-7)))
++    exp_q = tl.maximum(tl.minimum(exp_q, 7.0), -6.0)
++
++    mant = ax / tl.exp2(exp_q) - 1.0
++    mant_q = tl.floor(mant * 8.0 + 0.5)
++    carry = mant_q >= 8.0
++    mant_q = tl.where(carry, 0.0, mant_q)
++    exp_q = tl.where(carry, tl.minimum(exp_q + 1.0, 7.0), exp_q)
++
++    exp_bits = (exp_q + 7.0).to(tl.int32)
++    mant_bits = mant_q.to(tl.int32)
++
++    # Subnormal quantization: value ~= mant/8 * 2^-6
++    sub_mant = tl.floor(ax * 512.0 + 0.5)  # 2^9
++    sub_mant = tl.maximum(tl.minimum(sub_mant, 7.0), 0.0).to(tl.int32)
++
++    exp_bits = tl.where(is_normal, exp_bits, 0)
++    mant_bits = tl.where(is_normal, mant_bits, sub_mant)
++    exp_bits = tl.where(is_zero, 0, exp_bits)
++    mant_bits = tl.where(is_zero, 0, mant_bits)
++
++    sign_bits = tl.where(sign, 1, 0).to(tl.int32)
++    byte_u8 = (sign_bits << 7) | (exp_bits << 3) | mant_bits
++    byte_i8 = tl.where(byte_u8 >= 128, byte_u8 - 256, byte_u8)
++    return byte_i8.to(tl.int8)
++
++
+ @triton.jit
+ def _reshape_and_cache_flash_kernel(
+     key_ptr,
+@@ -31,6 +76,8 @@ def _reshape_and_cache_flash_kernel(
+     stride_vn: tl.constexpr,
+     stride_vd: tl.constexpr,
+     FP8_KV_CACHE: tl.constexpr,
++    INT8_KV_CACHE: tl.constexpr,
++    FP8_V_EMUL: tl.constexpr,  # Use FP8-E4M3 emulation for V
+     USE_FP8_SCALES: tl.constexpr,
+     KV_CACHE_DTYPE: tl.constexpr,
+     HEAD_SIZE: tl.constexpr,
+@@ -82,6 +129,17 @@ def _reshape_and_cache_flash_kernel(
+     if FP8_KV_CACHE:
+         key_tile = key_load.to(KV_CACHE_DTYPE)
+         value_tile = value_load.to(KV_CACHE_DTYPE)
++    elif INT8_KV_CACHE:
++        # INT8 quantization for K: scale, round, clamp to [-128, 127]
++        key_scaled = key_load.to(tl.float32) / tl.load(k_scale)
++        key_rounded = tl.extra.cuda.libdevice.round(key_scaled)
++        key_tile = tl.maximum(tl.minimum(key_rounded, 127.0), -128.0).to(tl.int8)
++
++        # V uses FP8-E4M3 emulation when enabled, otherwise INT8
++        value_scaled = value_load.to(tl.float32) / tl.load(v_scale)
++        if FP8_V_EMUL:
++            value_tile = _fp8_e4m3_encode_to_int8(value_scaled)
++        else:
++            value_rounded = tl.extra.cuda.libdevice.round(value_scaled)
++            value_tile = tl.maximum(tl.minimum(value_rounded, 127.0), -128.0).to(tl.int8)
+     else:
+         key_tile = key_load
+         value_tile = value_load
+
+# In reshape_and_cache_flash() function, add INT8 dtype handling:
+@@ -159,6 +217,12 @@ def reshape_and_cache_flash(...):
+     if kv_cache_dtype.startswith("fp8"):
+         kv_cache_torch_dtype = ...
++    elif kv_cache_dtype == "int8":
++        kv_cache_torch_dtype = torch.int8
+
++    INT8_KV_CACHE = kv_cache_dtype == "int8"
++    FP8_V_EMUL = os.getenv("VLLM_INT8_V_FP8_EMUL", "0") == "1"
++    # Pass INT8_KV_CACHE and FP8_V_EMUL to kernel call
+
+--- a/v1/attention/ops/triton_unified_attention.py
++++ b/v1/attention/ops/triton_unified_attention.py
+@@ -8,6 +8,7 @@
+ #  - Thomas Parnell <tpa@zurich.ibm.com>
+
++import os
+ import torch
+
+ from vllm.logger import init_logger
+@@ -20,6 +21,28 @@ is_batch_invariant = vllm_is_batch_invariant()
+ float8_info = torch.finfo(current_platform.fp8_dtype())
+
+
++@triton.jit
++def fp8_e4m3_decode_from_int8(x_i8):
++    """Decode emulated FP8 E4M3 byte codes stored in int8 tensors.
++
++    Format: 1 sign bit + 4 exponent bits + 3 mantissa bits
++    Range: [-448, 448] (no inf/NaN - encoder saturates at max normal)
++    """
++    x_i32 = x_i8.to(tl.int32)
++    x_u8 = tl.where(x_i32 < 0, x_i32 + 256, x_i32)
++    sign = (x_u8 >> 7) & 0x1
++    exp_bits = (x_u8 >> 3) & 0xF
++    mant_bits = x_u8 & 0x7
++
++    mant_f = mant_bits.to(tl.float32) * 0.125
++    normal = (1.0 + mant_f) * tl.exp2(exp_bits.to(tl.float32) - 7.0)
++    subnormal = mant_f * tl.exp2(-6.0)
++
++    val = tl.where(exp_bits == 0, subnormal, normal)
++    return tl.where(sign == 1, -val, val)
++
++
+ @triton.jit
+ def cdiv_fn(x, y):
+     return (x + y - 1) // y
+@@ -105,6 +128,8 @@ def _unified_attention_kernel(
+     BLOCK_D: tl.constexpr,
+     USE_ALIBI: tl.constexpr,
+     FP8_KV_CACHE: tl.constexpr,
++    INT8_KV_CACHE: tl.constexpr,
++    FP8_V_EMUL: tl.constexpr,  # Use FP8-E4M3 decode for V
+     KV_CACHE_DTYPE: tl.constexpr,
+     ...
+ ):
+@@ -265,6 +290,17 @@ def _unified_attention_kernel(
+         if FP8_KV_CACHE:
+             K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+             V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
++        elif INT8_KV_CACHE:
++            # INT8 dequantization for K: multiply by scale
++            K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
++
++            # V uses FP8-E4M3 decode when enabled, otherwise standard INT8
++            if FP8_V_EMUL:
++                V = (fp8_e4m3_decode_from_int8(V_load) * tl.load(v_scale)).to(Q.dtype)
++            else:
++                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+         else:
+             K = K_load
+             V = V_load
+
+# Add INT8_KV_CACHE and FP8_V_EMUL to all kernel invocations in unified_attention():
+@@ -1055,6 +1091,8 @@ def unified_attention(...):
+             ...
+             FP8_KV_CACHE=k.dtype in (torch.float8_e4m3fn, ...),
++            INT8_KV_CACHE=k.dtype == torch.int8,
++            FP8_V_EMUL=os.getenv("VLLM_INT8_V_FP8_EMUL", "0") == "1",
+             ...
+         )
+
+--- a/model_executor/layers/attention/attention.py
++++ b/model_executor/layers/attention/attention.py
+@@ -1,5 +1,6 @@
+ # Standard imports
+ from typing import ...
++import os
+
+ # ... existing imports ...
+
+@@ -109,6 +110,17 @@ def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) ->
+     """
+     from vllm import envs
+
++    # Use INT8 range (127) when kv_cache_dtype is "int8"
++    # With FP8-V emulation, V uses range 448 (FP8-E4M3 max)
++    kv_cache_dtype = getattr(layer, 'kv_cache_dtype', 'auto')
++    if kv_cache_dtype == 'int8':
++        k_range_val = 127  # INT8 symmetric range
++        if os.getenv("VLLM_INT8_V_FP8_EMUL", "0") == "1":
++            v_range_val = 448  # FP8-E4M3 max finite value
++        else:
++            v_range_val = 127  # INT8 symmetric range
++    else:
++        # FP8 defaults from environment variables
+         k_range_val = envs.K_SCALE_CONSTANT
+         v_range_val = envs.V_SCALE_CONSTANT
+
+     layer.q_range = torch.tensor(envs.Q_SCALE_CONSTANT, dtype=torch.float32)
+     layer.k_range = torch.tensor(k_range_val, dtype=torch.float32)
+     layer.v_range = torch.tensor(v_range_val, dtype=torch.float32)
+
+@@ -496,6 +508,14 @@ class Attention(...):
+     def calc_kv_scales(self, query, key, value):
++        # Skip scale calculation entirely during CUDA graph capture.
++        # Tensor creation, .item(), and even some tensor ops are not allowed
++        # during capture. Scales should be pre-calibrated before graph capture.
++        if torch.cuda.is_current_stream_capturing():
++            return
++
+         q_absmax = torch.abs(query).max()
+         k_absmax = key.abs().amax()
+         v_absmax = value.abs().amax()
++        used_default_k_scale = False
++        used_default_v_scale = False
+
++        # For INT8: if absmax is too small (warmup with zeros), use a reasonable
++        # default to avoid division by zero or tiny scales.
++        is_int8 = hasattr(self, 'kv_cache_dtype') and self.kv_cache_dtype == 'int8'
++        if is_int8:
++            if k_absmax.item() < 0.01:
++                k_absmax = torch.tensor(20.0, device=k_absmax.device, dtype=k_absmax.dtype)
++                used_default_k_scale = True
++            if v_absmax.item() < 0.01:
++                v_absmax = torch.tensor(20.0, device=v_absmax.device, dtype=v_absmax.dtype)
++                used_default_v_scale = True
+
+         self._q_scale.copy_(q_absmax / self.q_range)
+         self._k_scale.copy_(k_absmax / self.k_range)
+         self._v_scale.copy_(v_absmax / self.v_range)
+
++        self._q_scale_float = self._q_scale.item()
++        self._k_scale_float = self._k_scale.item()
++        self._v_scale_float = self._v_scale.item()
++
++        # For INT8 warmup passes with near-zero activations, keep calculation
++        # enabled until at least one non-fallback K/V observation is seen.
++        if is_int8 and (used_default_k_scale or used_default_v_scale):
++            self.calculate_kv_scales = True
++        else:
++            self.calculate_kv_scales = False

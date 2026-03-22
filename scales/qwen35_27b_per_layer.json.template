@@ -1,0 +1,13 @@
+{
+  "model": "Qwen/Qwen3.5-27B-GPTQ-Int4",
+  "kv_cache_dtype": "int8",
+  "mode": "per_layer",
+  "num_layers": 64,
+  "calibration_notes": "Template file - replace with actual calibrated scales",
+  "layers": {
+    "0": {"k_scale": 0.2, "v_scale": 5.0, "k_absmax": 25.4, "v_absmax": 635.0},
+    "1": {"k_scale": 0.3, "v_scale": 0.7, "k_absmax": 38.1, "v_absmax": 88.9},
+    "2": {"k_scale": 0.25, "v_scale": 0.25, "k_absmax": 31.75, "v_absmax": 31.75},
+    "_comment": "Add remaining layers after running calibration"
+  }
+}

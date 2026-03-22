@@ -1,0 +1,767 @@
+diff --git a/vllm/config/cache.py b/vllm/config/cache.py
+index 8a9eb48..b18656a 100644
+--- a/vllm/config/cache.py
++++ b/vllm/config/cache.py
+@@ -20,6 +20,7 @@ CacheDType = Literal[
+     "fp8_e5m2",
+     "fp8_inc",
+     "fp8_ds_mla",
++    "int8",  # INT8 KV cache for Ampere GPUs (RTX 3090)
+ ]
+ MambaDType = Literal["auto", "float32", "float16"]
+ MambaCacheMode = Literal["all", "align", "none"]
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 2f93b2c..a1f72a3 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -287,7 +287,7 @@ def use_aot_compile() -> bool:
+ 
+     default_value = (
+         "1"
+-        if is_torch_equal_or_newer("2.10.0") and not disable_compile_cache()
++        if is_torch_equal_or_newer("2.12.0")  # PATCHED: FakeTensorMode fix and not disable_compile_cache()
+         else "0"
+     )
+ 
+diff --git a/vllm/model_executor/layers/attention/attention.py b/vllm/model_executor/layers/attention/attention.py
+index 5516cd3..e13ef72 100644
+--- a/vllm/model_executor/layers/attention/attention.py
++++ b/vllm/model_executor/layers/attention/attention.py
+@@ -393,8 +393,9 @@ class Attention(nn.Module, AttentionLayerBase):
+         context using
+         `vllm.forward_context.get_forward_context().attn_metadata`.
+         """
+-        if self.calculate_kv_scales:
+-            torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
++        # Always check for pre-loaded scales (works for hybrid models too)
++        # and calculate scales if enabled
++        torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
+         output_dtype = query.dtype
+         if self.query_quant is not None:
+             # quantizing with a simple torch operation enables
+@@ -479,9 +480,50 @@ class Attention(nn.Module, AttentionLayerBase):
+                 )
+ 
+     def calc_kv_scales(self, query, key, value):
++        # Import per-layer scale utilities
++        from vllm.v1.attention.per_layer_scales import (
++            get_layer_scales,
++            has_loaded_scales,
++            is_recording_enabled,
++            record_kv_absmax,
++        )
++
++        # Check if we have pre-loaded scales for this layer
++        if has_loaded_scales():
++            layer_scales = get_layer_scales(self.layer_name)
++            if layer_scales is not None:
++                k_scale = layer_scales["k_scale"]
++                v_scale = layer_scales["v_scale"]
++                self._q_scale.copy_(torch.abs(query).max() / self.q_range)
++                self._k_scale.copy_(k_scale)
++                self._v_scale.copy_(v_scale)
++                self._q_scale_float = self._q_scale.item()
++                self._k_scale_float = k_scale
++                self._v_scale_float = v_scale
++                self.calculate_kv_scales = False
++                return
++
++        # Dynamic scale computation
++        k_absmax = torch.abs(key).max().item()
++        v_absmax = torch.abs(value).max().item()
++
++        # Record for calibration if enabled
++        if is_recording_enabled():
++            record_kv_absmax(self.layer_name, k_absmax, v_absmax)
++            # In recording mode, keep recalculating to track max across prompts
++            # We still set scales for current inference
++            self._q_scale.copy_(torch.abs(query).max() / self.q_range)
++            self._k_scale.copy_(k_absmax / self.k_range.item())
++            self._v_scale.copy_(v_absmax / self.v_range.item())
++            self._q_scale_float = self._q_scale.item()
++            self._k_scale_float = self._k_scale.item()
++            self._v_scale_float = self._v_scale.item()
++            # DON'T set calculate_kv_scales to False - keep recording
++            return
++
+         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
+-        self._k_scale.copy_(torch.abs(key).max() / self.k_range)
+-        self._v_scale.copy_(torch.abs(value).max() / self.v_range)
++        self._k_scale.copy_(k_absmax / self.k_range.item())
++        self._v_scale.copy_(v_absmax / self.v_range.item())
+         self._q_scale_float = self._q_scale.item()
+         self._k_scale_float = self._k_scale.item()
+         self._v_scale_float = self._v_scale.item()
+@@ -548,6 +590,34 @@ def maybe_calc_kv_scales(
+     forward_context: ForwardContext = get_forward_context()
+     self = forward_context.no_compile_layers[layer_name]
+ 
++    # Import per-layer scale utilities
++    from vllm.v1.attention.per_layer_scales import (
++        get_layer_scales,
++        has_loaded_scales,
++    )
++
++    # First check for pre-loaded scales from file (works even when
++    # calculate_kv_scales=False, e.g., for hybrid models)
++    has_scales = has_loaded_scales()
++    if has_scales:
++        layer_scales = get_layer_scales(layer_name)
++        if layer_scales is not None and self._k_scale_float == 1.0:
++            # Apply pre-loaded scales (only once)
++            k_scale = layer_scales["k_scale"]
++            v_scale = layer_scales["v_scale"]
++            self._q_scale.copy_(torch.abs(query).max() / self.q_range)
++            self._k_scale.copy_(k_scale)
++            self._v_scale.copy_(v_scale)
++            self._q_scale_float = self._q_scale.item()
++            self._k_scale_float = k_scale
++            self._v_scale_float = v_scale
++            self.calculate_kv_scales = False
++            import logging
++            logging.getLogger(__name__).info(
++                f"Applied pre-loaded scales for {layer_name}: k={k_scale:.4f}, v={v_scale:.4f}"
++            )
++            return
++
+     # Only calculate if the layer's calculate_kv_scales flag is True
+     # This flag gets set to False after the first forward pass
+     if not self.calculate_kv_scales:
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index a5644a4..d1ee6ea 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -118,16 +118,27 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
+         # Disable calculate_kv_scales for hybrid models: uninitialized
+         # recurrent state corrupts scales during the calibration pass.
+         # See issue: https://github.com/vllm-project/vllm/issues/37554
+-        if cache_config.calculate_kv_scales:
++        # Override with VLLM_FORCE_CALC_KV_SCALES=1 for calibration
++        import os
++        force_calc_scales = os.getenv("VLLM_FORCE_CALC_KV_SCALES", "0") == "1"
++        if cache_config.calculate_kv_scales and not force_calc_scales:
+             logger.warning(
+                 "Disabling calculate_kv_scales for hybrid model '%s'. "
+                 "Hybrid models with recurrent layers (GDN, Mamba, SSM) "
+                 "produce unreliable KV cache scales during the "
+                 "calibration pass because recurrent state is "
+-                "uninitialized. Using default scale of 1.0 instead.",
++                "uninitialized. Using default scale of 1.0 instead. "
++                "Override with VLLM_FORCE_CALC_KV_SCALES=1.",
+                 vllm_config.model_config.model,
+             )
+             cache_config.calculate_kv_scales = False
++        elif cache_config.calculate_kv_scales and force_calc_scales:
++            logger.warning(
++                "VLLM_FORCE_CALC_KV_SCALES=1 set. Enabling scale calculation "
++                "for hybrid model '%s'. Note: recurrent state may affect "
++                "scale accuracy. Run enough warmup prompts for calibration.",
++                vllm_config.model_config.model,
++            )
+ 
+         # Save the user input before it gets modified by MambaModelConfig
+         mamba_block_size = cache_config.mamba_block_size
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index cd49ea3..a8b2fad 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -937,7 +937,7 @@ class SparseMLAAttentionImpl(AttentionImplBase[T], Generic[T]):
+ 
+ 
+ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
+-    return kv_cache_dtype.startswith("fp8")
++    return kv_cache_dtype.startswith("fp8") or kv_cache_dtype == "int8"
+ 
+ 
+ def subclass_attention_backend(
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index 6d967b5..07bab15 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -268,6 +268,7 @@ class TritonAttentionBackend(AttentionBackend):
+         "fp8",
+         "fp8_e4m3",
+         "fp8_e5m2",
++        "int8",  # INT8 KV cache for Ampere GPUs
+     ]
+ 
+     @staticmethod
+@@ -624,9 +625,13 @@ class TritonAttentionImpl(AttentionImpl):
+         flash_layout = True
+ 
+         is_fp8_kv_cache = self.kv_cache_dtype.startswith("fp8")
++        is_int8_kv_cache = self.kv_cache_dtype == "int8"
++        is_quantized_kv_cache = is_fp8_kv_cache or is_int8_kv_cache
++
+         if is_fp8_kv_cache:
+             key_cache = key_cache.view(self.fp8_dtype)
+             value_cache = value_cache.view(self.fp8_dtype)
++        # INT8 cache is already stored as int8, no view conversion needed
+ 
+         rocm_aiter_ops.triton_rope_and_cache(
+             query,
+@@ -641,5 +646,5 @@ class TritonAttentionImpl(AttentionImpl):
+             layer._k_scale,
+             layer._v_scale,
+             flash_layout,
+-            is_fp8_kv_cache,
++            is_quantized_kv_cache,
+         )
+diff --git a/vllm/v1/attention/ops/triton_reshape_and_cache_flash.py b/vllm/v1/attention/ops/triton_reshape_and_cache_flash.py
+index c5c9a9c..67a3b3e 100644
+--- a/vllm/v1/attention/ops/triton_reshape_and_cache_flash.py
++++ b/vllm/v1/attention/ops/triton_reshape_and_cache_flash.py
+@@ -1,11 +1,65 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ import torch
+ 
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ 
++# FP8-E4M3 emulation for V values in INT8 KV cache mode
++# This provides better precision for V (340x variance) vs simple INT8
++# NOTE: Evaluated at runtime (not module import) to support subprocess env vars
++def _get_fp8_v_emul() -> bool:
++    return os.getenv("VLLM_INT8_V_FP8_EMUL", "0") == "1"
++
++
++@triton.jit
++def _fp8_e4m3_encode(x):
++    """Encode float32 to FP8-E4M3 format stored as int8 bytes.
++
++    FP8-E4M3: 1 sign + 4 exponent + 3 mantissa, range [-448, 448]
++    """
++    ax = tl.abs(x)
++    sign = tl.where(x < 0, 128, 0)  # sign bit = 0x80
++
++    # Handle zero
++    is_zero = ax < 1e-7
++
++    # Compute exponent and mantissa for normal numbers
++    # exp_bias = 7, so exp_bits = floor(log2(ax)) + 7
++    log_val = tl.log2(tl.maximum(ax, 1e-7))
++    exp_unbiased = tl.floor(log_val)
++    exp_unbiased = tl.maximum(tl.minimum(exp_unbiased, 7.0), -6.0)
++
++    # mantissa = (ax / 2^exp - 1) * 8, rounded
++    mant = ax / tl.exp2(exp_unbiased) - 1.0
++    mant_bits = tl.floor(mant * 8.0 + 0.5)
++
++    # Handle mantissa overflow (carry to exponent)
++    carry = mant_bits >= 8.0
++    mant_bits = tl.where(carry, 0.0, mant_bits)
++    exp_unbiased = tl.where(carry, tl.minimum(exp_unbiased + 1.0, 7.0), exp_unbiased)
++
++    exp_bits = (exp_unbiased + 7.0).to(tl.int32)  # bias = 7
++    mant_int = mant_bits.to(tl.int32)
++
++    # Subnormal: exp_bits = 0, mant encodes value directly
++    is_subnormal = ax < 0.015625  # 2^-6
++    sub_mant = tl.floor(ax * 512.0 + 0.5).to(tl.int32)  # ax * 2^9
++    sub_mant = tl.maximum(tl.minimum(sub_mant, 7), 0)
++
++    exp_bits = tl.where(is_subnormal, 0, exp_bits)
++    mant_int = tl.where(is_subnormal, sub_mant, mant_int)
++    exp_bits = tl.where(is_zero, 0, exp_bits)
++    mant_int = tl.where(is_zero, 0, mant_int)
++
++    # Pack: sign(1) | exp(4) | mant(3)
++    result = sign.to(tl.int32) | (exp_bits << 3) | mant_int
++    # Convert to signed int8 range
++    result = tl.where(result >= 128, result - 256, result)
++    return result.to(tl.int8)
++
+ 
+ @triton.jit
+ def reshape_and_cache_kernel_flash(
+@@ -31,6 +85,7 @@ def reshape_and_cache_kernel_flash(
+     USE_HEAD_MAJOR_LAYOUT: tl.constexpr,
+     # FP8 flags
+     FP8_KV_CACHE: tl.constexpr,
++    FP8_V_EMUL: tl.constexpr,
+     # tune parameters
+     TILE_SIZE: tl.constexpr,
+ ):
+@@ -78,7 +133,7 @@ def reshape_and_cache_kernel_flash(
+         key_ptr + src_key_idx + tile_pos, mask=tile_pos < (num_heads * head_size)
+     )
+     if FP8_KV_CACHE:
+-        # tl.store will do the correct implicit cast to fp8,
++        # tl.store will do the correct implicit cast to fp8 or int8,
+         # based on the key_cache_ptr.dtype.element_ty
+         key_tile = key_load if key_load.dtype.is_fp8() else key_load / tl.load(k_scale)
+     else:
+@@ -91,9 +146,13 @@ def reshape_and_cache_kernel_flash(
+     if FP8_KV_CACHE:
+         if value_load.dtype.is_fp8():
+             value_tile = value_load
++        elif FP8_V_EMUL:
++            # FP8-E4M3 emulation for INT8 KV cache: logarithmic encoding
++            # Handles 340x variance in V activations better than linear INT8
++            value_scaled = value_load / tl.load(v_scale)
++            value_tile = _fp8_e4m3_encode(value_scaled)
+         else:
+-            # tl.store will do the correct implicit cast to fp8,
+-            #  based on the value_cache_ptr.dtype.element_ty
++            # Standard FP8/INT8: implicit cast handles it
+             value_tile = value_load / tl.load(v_scale)
+     else:
+         value_tile = value_load
+@@ -145,12 +204,13 @@ def triton_reshape_and_cache_flash(
+     block_stride = key_cache.stride()[0]
+     page_stride = key_cache.stride()[1]
+ 
+-    assert kv_cache_dtype == "auto" or kv_cache_dtype.startswith("fp8"), (
++    assert kv_cache_dtype == "auto" or kv_cache_dtype.startswith("fp8") or kv_cache_dtype == "int8", (
+         f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
+     )
+     kv_cache_torch_dtype = (
+         current_platform.fp8_dtype()
+         if kv_cache_dtype.startswith("fp8")
++        else torch.int8 if kv_cache_dtype == "int8"
+         else key_cache.dtype
+     )
+ 
+@@ -164,12 +224,14 @@ def triton_reshape_and_cache_flash(
+         "uint8 is not supported by triton reshape_and_cache_flash"
+     )
+ 
+-    FP8_KV_CACHE = kv_cache_dtype.startswith("fp8")
++    FP8_KV_CACHE = kv_cache_dtype.startswith("fp8") or kv_cache_dtype == "int8"
++    FP8_V_EMUL = _get_fp8_v_emul() and kv_cache_dtype == "int8"
+     assert (not FP8_KV_CACHE) or kv_cache_torch_dtype in [
+         torch.float8_e4m3fn,
+         torch.float8_e5m2,
+         torch.uint8,
+         torch.float8_e4m3fnuz,
++        torch.int8,  # INT8 KV cache for Ampere
+     ], (
+         "unsupported dtype of KV cache tensor, got "
+         "{kv_cache_torch_dtype}. Supported kv cache dtypes: fp8e4m3fn, "
+@@ -217,6 +279,7 @@ def triton_reshape_and_cache_flash(
+         USE_HEAD_MAJOR_LAYOUT=use_head_major_layout,
+         # FP8 flags
+         FP8_KV_CACHE=FP8_KV_CACHE,
++        FP8_V_EMUL=FP8_V_EMUL,
+         # autotune parameters
+         TILE_SIZE=TILE_SIZE,
+         num_warps=num_warps,
+@@ -243,6 +306,7 @@ def reshape_and_cache_kernel_flash_diffkv(
+     block_size: tl.constexpr,
+     # FP8 flags
+     FP8_KV_CACHE: tl.constexpr,
++    FP8_V_EMUL: tl.constexpr,
+     # tune parameters
+     TILE_SIZE: tl.constexpr,
+ ):
+@@ -283,9 +347,12 @@ def reshape_and_cache_kernel_flash_diffkv(
+     if FP8_KV_CACHE:
+         if value_load.dtype.is_fp8():
+             value_tile = value_load
++        elif FP8_V_EMUL:
++            # FP8-E4M3 emulation for INT8 KV cache
++            value_scaled = value_load / tl.load(v_scale)
++            value_tile = _fp8_e4m3_encode(value_scaled)
+         else:
+-            # tl.store will do the correct implicit cast to fp8,
+-            #  based on the value_cache_ptr.dtype.element_ty
++            # Standard FP8/INT8: implicit cast handles it
+             value_tile = value_load / tl.load(v_scale)
+     else:
+         value_tile = value_load
+@@ -323,7 +390,7 @@ def triton_reshape_and_cache_flash_diffkv(
+     block_stride = kv_cache.stride()[0]
+     page_stride = kv_cache.stride()[1]
+ 
+-    assert kv_cache_dtype == "auto" or kv_cache_dtype.startswith("fp8"), (
++    assert kv_cache_dtype == "auto" or kv_cache_dtype.startswith("fp8") or kv_cache_dtype == "int8", (
+         f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
+     )
+     kv_cache_torch_dtype = (
+@@ -341,12 +408,14 @@ def triton_reshape_and_cache_flash_diffkv(
+         "uint8 is not supported by triton reshape_and_cache_flash_diffkv"
+     )
+ 
+-    FP8_KV_CACHE = kv_cache_dtype.startswith("fp8")
++    FP8_KV_CACHE = kv_cache_dtype.startswith("fp8") or kv_cache_dtype == "int8"
++    FP8_V_EMUL = _get_fp8_v_emul() and kv_cache_dtype == "int8"
+     assert (not FP8_KV_CACHE) or kv_cache_torch_dtype in [
+         torch.float8_e4m3fn,
+         torch.float8_e5m2,
+         torch.uint8,
+         torch.float8_e4m3fnuz,
++        torch.int8,  # INT8 KV cache for Ampere
+     ], (
+         "unsupported dtype of KV cache tensor, got "
+         "{kv_cache_torch_dtype}. Supported kv cache dtypes: fp8e4m3fn, "
+@@ -388,6 +457,7 @@ def triton_reshape_and_cache_flash_diffkv(
+         block_size=block_size,
+         # FP8 flags
+         FP8_KV_CACHE=FP8_KV_CACHE,
++        FP8_V_EMUL=FP8_V_EMUL,
+         # autotune parameters
+         TILE_SIZE=TILE_SIZE,
+         num_warps=num_warps,
+diff --git a/vllm/v1/attention/ops/triton_unified_attention.py b/vllm/v1/attention/ops/triton_unified_attention.py
+index 4ddd47c..066cfea 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention.py
++++ b/vllm/v1/attention/ops/triton_unified_attention.py
+@@ -7,6 +7,7 @@
+ #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
+ #  - Thomas Parnell <tpa@zurich.ibm.com>
+ 
++import os
+ import torch
+ 
+ from vllm.logger import init_logger
+@@ -18,6 +19,39 @@ logger = init_logger(__name__)
+ is_batch_invariant = vllm_is_batch_invariant()
+ float8_info = torch.finfo(current_platform.fp8_dtype())
+ 
++# FP8-E4M3 emulation for V values in INT8 KV cache mode
++# NOTE: Evaluated at runtime (not module import) to support subprocess env vars
++def _get_fp8_v_emul() -> bool:
++    return os.getenv("VLLM_INT8_V_FP8_EMUL", "0") == "1"
++
++
++@triton.jit
++def _fp8_e4m3_decode(x_i8):
++    """Decode FP8-E4M3 format from int8 bytes to float32.
++
++    FP8-E4M3: 1 sign + 4 exponent + 3 mantissa, range [-448, 448]
++    """
++    # Convert signed int8 to unsigned interpretation
++    x_i32 = x_i8.to(tl.int32)
++    x_u8 = tl.where(x_i32 < 0, x_i32 + 256, x_i32)
++
++    # Unpack bits
++    sign = (x_u8 >> 7) & 0x1
++    exp_bits = (x_u8 >> 3) & 0xF
++    mant_bits = x_u8 & 0x7
++
++    # Decode mantissa fraction (0.0 to 0.875)
++    mant_f = mant_bits.to(tl.float32) * 0.125
++
++    # Normal: value = (1 + mant_f) * 2^(exp - 7)
++    normal = (1.0 + mant_f) * tl.exp2(exp_bits.to(tl.float32) - 7.0)
++
++    # Subnormal (exp=0): value = mant_f * 2^(-6)
++    subnormal = mant_f * tl.exp2(-6.0)
++
++    val = tl.where(exp_bits == 0, subnormal, normal)
++    return tl.where(sign == 1, -val, val)
++
+ 
+ @triton.jit
+ def cdiv_fn(x, y):
+@@ -105,6 +139,7 @@ def kernel_unified_attention_2d(
+     num_seqs: tl.int32,
+     BLOCK_M: tl.constexpr,  # int
+     USE_FP8: tl.constexpr,  # bool
++    FP8_V_EMUL: tl.constexpr,  # bool - FP8 emulation for V values
+     FP8_MIN: tl.constexpr = float8_info.min,
+     FP8_MAX: tl.constexpr = float8_info.max,
+ ):
+@@ -259,7 +294,8 @@ def kernel_unified_attention_2d(
+             other=0.0,
+         )
+ 
+-        if K_load.dtype.is_fp8():
++        # Handle FP8 and INT8 quantized KV cache dequantization
++        if K_load.dtype.is_fp8() or K_load.dtype == tl.int8:
+             if Q.dtype.is_fp8():
+                 K = K_load
+             else:
+@@ -274,11 +310,20 @@ def kernel_unified_attention_2d(
+             other=0.0,
+         )
+ 
++        # Handle FP8 and INT8 quantized KV cache dequantization
+         if V_load.dtype.is_fp8():
+             if Q.dtype.is_fp8():
+                 V = V_load
+             else:
+                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
++        elif V_load.dtype == tl.int8:
++            # INT8 KV cache: check if V uses FP8-E4M3 emulation
++            if FP8_V_EMUL:
++                # Decode FP8-E4M3 format from int8 bytes
++                V = (_fp8_e4m3_decode(V_load) * tl.load(v_scale)).to(Q.dtype)
++            else:
++                # Simple INT8: linear dequantization
++                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+         else:
+             V = V_load
+ 
+@@ -453,6 +498,7 @@ def kernel_unified_attention_3d(
+     USE_MM_PREFIX: tl.constexpr,  # bool
+     MAX_MM_RANGES: tl.constexpr,  # int
+     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
++    FP8_V_EMUL: tl.constexpr,  # bool - FP8 emulation for V values
+ ):
+     q_block_global_idx = tl.program_id(0)
+     kv_head_idx = tl.program_id(1)
+@@ -614,7 +660,8 @@ def kernel_unified_attention_3d(
+             other=0.0,
+         )
+ 
+-        if K_load.dtype.is_fp8():
++        # Handle FP8 and INT8 quantized KV cache dequantization
++        if K_load.dtype.is_fp8() or K_load.dtype == tl.int8:
+             if Q.dtype.is_fp8():
+                 K = K_load
+             else:
+@@ -629,11 +676,20 @@ def kernel_unified_attention_3d(
+             other=0.0,
+         )
+ 
++        # Handle FP8 and INT8 quantized KV cache dequantization
+         if V_load.dtype.is_fp8():
+             if Q.dtype.is_fp8():
+                 V = V_load
+             else:
+                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
++        elif V_load.dtype == tl.int8:
++            # INT8 KV cache: check if V uses FP8-E4M3 emulation
++            if FP8_V_EMUL:
++                # Decode FP8-E4M3 format from int8 bytes
++                V = (_fp8_e4m3_decode(V_load) * tl.load(v_scale)).to(Q.dtype)
++            else:
++                # Simple INT8: linear dequantization
++                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+         else:
+             V = V_load
+ 
+@@ -1040,6 +1096,7 @@ def unified_attention(
+             num_seqs=num_seqs,
+             BLOCK_M=BLOCK_M,
+             USE_FP8=output_scale is not None,
++            FP8_V_EMUL=_get_fp8_v_emul() and v.dtype == torch.int8,
+         )
+     else:
+         kernel_unified_attention_3d[
+@@ -1092,6 +1149,7 @@ def unified_attention(
+             num_seqs=num_seqs,
+             BLOCK_M=BLOCK_M,
+             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
++            FP8_V_EMUL=_get_fp8_v_emul() and v.dtype == torch.int8,
+         )
+         reduce_segments[(q.shape[0], num_query_heads)](
+             output_ptr=out,
+diff --git a/vllm/v1/attention/per_layer_scales.py b/vllm/v1/attention/per_layer_scales.py
+new file mode 100644
+index 0000000..d9dc3c6
+--- /dev/null
++++ b/vllm/v1/attention/per_layer_scales.py
+@@ -0,0 +1,208 @@
++# SPDX-License-Identifier: Apache-2.0
++"""
++Per-layer KV cache scale management for INT8/FP8 quantization.
++
++Supports:
++- Recording K/V absmax per layer during calibration
++- Saving per-layer scales to JSON file
++- Loading per-layer scales from JSON file
++
++Environment variables:
++- VLLM_KV_SCALES_RECORD=1: Enable recording mode
++- VLLM_KV_SCALES_FILE=/path/to/scales.json: Load scales from file
++
++Usage:
++1. Calibration mode:
++   VLLM_KV_SCALES_RECORD=1 vllm serve ... --kv-cache-dtype int8 --calculate-kv-scales
++   # Run diverse prompts
++   # Scales are saved to /tmp/vllm_kv_scales.json on server shutdown
++
++2. Inference mode:
++   VLLM_KV_SCALES_FILE=/path/to/scales.json vllm serve ... --kv-cache-dtype int8
++"""
++
++import atexit
++import json
++import os
++import threading
++from pathlib import Path
++from typing import Dict, Optional
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++# Global state for scale recording
++_lock = threading.Lock()
++_layer_stats: Dict[str, Dict[str, float]] = {}
++_scales_loaded: Dict[str, Dict[str, float]] = {}
++# NOTE: Check env vars dynamically to support subprocess environment inheritance
++_recording_enabled: Optional[bool] = None
++_scales_file: Optional[str] = None
++
++
++def _get_recording_enabled() -> bool:
++    """Get recording enabled status, checking env var on first call."""
++    global _recording_enabled
++    if _recording_enabled is None:
++        _recording_enabled = os.getenv("VLLM_KV_SCALES_RECORD", "0") == "1"
++        if _recording_enabled:
++            logger.info("Per-layer KV scale recording ENABLED")
++    return _recording_enabled
++
++
++def _get_scales_file() -> str:
++    """Get scales file path, checking env var on first call."""
++    global _scales_file
++    if _scales_file is None:
++        _scales_file = os.getenv("VLLM_KV_SCALES_FILE", "")
++    return _scales_file
++
++
++def record_kv_absmax(layer_name: str, k_absmax: float, v_absmax: float) -> None:
++    """Record observed K/V absmax for a layer. Keeps track of maximum seen."""
++    if not _get_recording_enabled():
++        return
++
++    with _lock:
++        if layer_name not in _layer_stats:
++            _layer_stats[layer_name] = {
++                "k_absmax": 0.0,
++                "v_absmax": 0.0,
++                "num_updates": 0,
++            }
++
++        stats = _layer_stats[layer_name]
++        stats["k_absmax"] = max(stats["k_absmax"], k_absmax)
++        stats["v_absmax"] = max(stats["v_absmax"], v_absmax)
++        stats["num_updates"] += 1
++
++
++def get_recorded_stats() -> Dict[str, Dict[str, float]]:
++    """Get all recorded per-layer statistics."""
++    with _lock:
++        return dict(_layer_stats)
++
++
++def save_scales(output_path: Optional[str] = None) -> None:
++    """Save recorded per-layer scales to JSON file."""
++    if not _layer_stats:
++        logger.warning("No scales recorded, nothing to save")
++        return
++
++    if output_path is None:
++        output_path = os.getenv("VLLM_KV_SCALES_OUTPUT", "/tmp/vllm_kv_scales.json")
++
++    path = Path(output_path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++
++    # Convert stats to scales
++    # Scale = absmax / range, where:
++    #   INT8: range = 127 (symmetric: -127 to 127)
++    #   FP8-E4M3: range = 448 (max representable value)
++    # Quantization: quant_value = value / scale
++    # This ensures values fit in the quantized range
++    use_fp8_v = os.getenv("VLLM_INT8_V_FP8_EMUL", "0") == "1"
++    k_range = 127.0  # INT8 range
++    v_range = 448.0 if use_fp8_v else 127.0  # FP8-E4M3 or INT8 range
++
++    scales_data = {
++        "version": "1.1",  # Updated version for fixed scales
++        "description": "Per-layer K/V scales for INT8 KV cache",
++        "k_range": k_range,
++        "v_range": v_range,
++        "fp8_v_emul": use_fp8_v,
++        "layers": {},
++    }
++
++    for layer_name, stats in sorted(_layer_stats.items()):
++        # Scale = absmax / range
++        k_scale = stats["k_absmax"] / k_range if stats["k_absmax"] > 0 else 1.0
++        v_scale = stats["v_absmax"] / v_range if stats["v_absmax"] > 0 else 1.0
++
++        scales_data["layers"][layer_name] = {
++            "k_absmax": stats["k_absmax"],
++            "v_absmax": stats["v_absmax"],
++            "k_scale": k_scale,
++            "v_scale": v_scale,
++            "num_updates": stats["num_updates"],
++        }
++
++    path.write_text(json.dumps(scales_data, indent=2))
++    logger.info(f"Saved per-layer KV scales to: {path}")
++
++    # Print summary
++    k_absmax_list = [s["k_absmax"] for s in scales_data["layers"].values()]
++    v_absmax_list = [s["v_absmax"] for s in scales_data["layers"].values()]
++    logger.info(f"K absmax range: {min(k_absmax_list):.2f} - {max(k_absmax_list):.2f}")
++    logger.info(f"V absmax range: {min(v_absmax_list):.2f} - {max(v_absmax_list):.2f}")
++    v_ratio = max(v_absmax_list) / max(min(v_absmax_list), 1e-10)
++    logger.info(f"V variance ratio: {v_ratio:.1f}x")
++
++
++def load_scales(scales_file: Optional[str] = None) -> bool:
++    """Load per-layer scales from JSON file."""
++    global _scales_loaded
++
++    if scales_file is None:
++        scales_file = _get_scales_file()
++
++    if not scales_file:
++        return False
++
++    path = Path(scales_file)
++    if not path.exists():
++        logger.warning(f"Scales file not found: {path}")
++        return False
++
++    try:
++        data = json.loads(path.read_text())
++        _scales_loaded = data.get("layers", {})
++        logger.info(f"Loaded per-layer scales from: {path}")
++        logger.info(f"Number of layers: {len(_scales_loaded)}")
++        return True
++    except Exception as e:
++        logger.error(f"Failed to load scales from {path}: {e}")
++        return False
++
++
++def get_layer_scales(layer_name: str) -> Optional[Dict[str, float]]:
++    """Get pre-loaded scales for a specific layer."""
++    return _scales_loaded.get(layer_name)
++
++
++_scales_load_attempted = False
++
++
++def has_loaded_scales() -> bool:
++    """Check if scales have been loaded from file."""
++    global _scales_load_attempted
++    # Try to load on first check
++    if not _scales_load_attempted:
++        _scales_load_attempted = True
++        scales_file = _get_scales_file()
++        logger.info(f"Checking for scales file: '{scales_file}'")
++        if scales_file:
++            load_scales(scales_file)
++            logger.info(f"Loaded {len(_scales_loaded)} layer scales")
++    return bool(_scales_loaded)
++
++
++def is_recording_enabled() -> bool:
++    """Check if recording mode is enabled."""
++    return _get_recording_enabled()
++
++
++# Auto-save on shutdown if recording was enabled
++def _atexit_save():
++    if _get_recording_enabled() and _layer_stats:
++        output_path = os.getenv("VLLM_KV_SCALES_OUTPUT", "/tmp/vllm_kv_scales.json")
++        save_scales(output_path)
++
++
++atexit.register(_atexit_save)
++
++# Auto-load scales if file specified - done lazily on first access
++# to support subprocess environment inheritance
