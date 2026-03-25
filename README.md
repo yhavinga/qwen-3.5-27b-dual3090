@@ -1,6 +1,23 @@
 # Qwen 3.5 27B — Dual RTX 3090 NVLink Maximum Performance
 
-Optimized setup for running Qwen 3.5 27B Q4 at maximum speed on dual RTX 3090s with NVLink.
+## TL;DR
+
+```bash
+pip install vllm==0.17.1
+
+vllm serve Qwen/Qwen3.5-27B-GPTQ-Int4 \
+  --tensor-parallel-size 2 \
+  --max-model-len 131072 \
+  --gpu-memory-utilization 0.92 \
+  --kv-cache-dtype auto \
+  --enable-chunked-prefill
+```
+
+**51 tok/s at 8K, 40 tok/s at 128K.** Only 22% degradation thanks to hybrid architecture.
+
+Use `--kv-cache-dtype auto` (FP16). INT8 KV cache is *slower* for hybrid models.
+
+---
 
 ## Performance Summary
 
@@ -29,38 +46,14 @@ vLLM 0.18.x has a regression: CUDA graph profiling OOMs on RTX 3090 due to tight
 ## Quick Start
 
 ```bash
-# Activate venv
-source venv/bin/activate
+# Verify NVLink
+nvidia-smi topo -m  # Should show NV4 between GPU0 and GPU1
 
-# Verify NVLink connectivity
-./scripts/check_nvlink.sh
-
-# Start server (downloads model on first run)
-./scripts/launch-server.sh
-
-# In another terminal, test
-python scripts/quick_test.py
-
-# Full benchmark
-python scripts/benchmark.py --output results/benchmark.json
+# Test the server
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen3.5-27B-GPTQ-Int4", "prompt": "Hello", "max_tokens": 50}'
 ```
-
-## Available Launch Scripts
-
-### Dense 27B (Highest Quality)
-
-| Script | Context | Use Case |
-|--------|---------|----------|
-| `launch-server.sh` | 65K | **Default** - best balance |
-| `launch-server-32k.sh` | 32K | Conservative, very stable |
-| `launch-server-int8kv.sh` | 128K | Maximum context (requires patch) |
-
-### MoE 35B-A3B (Highest Speed)
-
-| Script | Config | Use Case |
-|--------|--------|----------|
-| `launch-server-35b-moe.sh` | Single GPU | Maximum tok/s (112+) |
-| `launch-server-35b-moe-dp2.sh` | DP=2 | Batch serving |
 
 ## Key Optimizations
 
