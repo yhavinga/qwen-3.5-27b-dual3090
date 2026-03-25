@@ -2,36 +2,29 @@
 
 Optimized setup for running Qwen 3.5 27B Q4 at maximum speed on dual RTX 3090s with NVLink.
 
-## Performance Summary (Tested 2026-03-21)
+## Performance Summary
 
-| Configuration | tok/s | Context | Notes |
-|--------------|-------|---------|-------|
-| **27B GPTQ-Int4 TP=2** | **49** | <1K | Peak decode speed |
-| 27B GPTQ-Int4 TP=2 | 42 | 2K | |
-| 27B GPTQ-Int4 TP=2 | 29 | 8K | |
-| 27B GPTQ-Int4 TP=2 | 20 | 16K | |
-| 27B GPTQ-Int4 TP=2 | 12 | 32K | Memory-bound |
-| **35B-A3B MoE** | 100-112 | 262K | Maximum speed (untested) |
+| Context | Decode (tok/s) | Prefill (tok/s) | Notes |
+|--------:|---------------:|----------------:|-------|
+| 8K | 51 | 1912 | Peak decode speed |
+| 32K | 45 | 1984 | Minimal degradation |
+| 64K | 39 | 1821 | |
+| 128K | 40 | 1548 | 83s TTFT |
+| 200K | ~30 | 1262 | 158s TTFT |
+
+**Key finding**: Only 22% speed degradation from 8K to 128K, thanks to hybrid architecture (25% attention + 75% GDN layers).
+
+See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for full analysis including comparison with Gemma 3 and RTX 5090.
 
 ## vLLM Version
 
-**Current: vLLM 0.18.1rc1 (built from source with patches)**
-
-Two critical patches applied:
-1. **FakeTensorMode fix** - Disables AOT compile for PyTorch <2.12 (prevents startup crash)
-2. **INT8 KV cache** - 50% memory reduction for 128K+ context on Ampere GPUs
-
-### Build from Source (Recommended)
-
-```bash
-./scripts/build_vllm_from_source.sh
-```
-
-### Alternative: vLLM 0.17.1 (Simple)
+**Recommended: vLLM 0.17.1**
 
 ```bash
 pip install vllm==0.17.1
 ```
+
+vLLM 0.18.x has a regression: CUDA graph profiling OOMs on RTX 3090 due to tight memory (model + GDN buffers = 22.5GB, only 80MB free). Use `enforce_eager=True` as workaround (4x slower).
 
 ## Quick Start
 
@@ -99,38 +92,36 @@ nvidia-smi topo -m
 --quantization gptq_marlin  # Fast Marlin kernels for GPTQ
 ```
 
-## INT8 KV Cache (Extended Context)
+## INT8 KV Cache — NOT Recommended for Qwen 3.5
 
-For 128K+ context, apply the INT8 KV cache patch:
+**INT8 KV cache makes Qwen 3.5 SLOWER**, not faster:
 
-```bash
-# Apply patch to vLLM
-./scripts/apply_int8_patch.sh
+| Context | FP16 | INT8 | Change |
+|--------:|-----:|-----:|-------:|
+| 8K | 51 | 50 | -2% |
+| 64K | 39 | 33 | -15% |
+| 128K | 40 | 26 | -35% |
 
-# Launch with INT8 KV
-./scripts/launch-server-int8kv.sh
+**Why?** Qwen 3.5 is a hybrid model with only 25% attention layers. INT8 quantization overhead affects all attention ops but only benefits 25% of the model.
 
-# Calibrate scales
-python scripts/calibrate_kv_scales.py
-```
+**When to use INT8**: Only if FP16 causes OOM (>200K context). INT8 doubles KV capacity but at 4x speed penalty.
 
-**How it works:**
-- K (keys): INT8 symmetric quantization
-- V (values): FP8-E4M3 emulated in INT8 storage
-- Per-layer calibrated scales handle 340x variance
+See [INT8_KV_CACHE_ANALYSIS.md](INT8_KV_CACHE_ANALYSIS.md) for detailed analysis.
 
-**Memory savings:**
-- 65K context: 8.5GB → 4.25GB KV cache
-- Enables 128K where BF16 would OOM
+## Single GPU?
 
-## Model Comparison
+**vLLM**: No. GDN buffers (~8.6GB) + model weights fill 24GB before KV cache allocation.
 
-| Model | Params Active | VRAM (Q4) | Quality | Speed |
-|-------|--------------|-----------|---------|-------|
-| 27B Dense | 27B | ~17GB | Highest | Baseline |
-| 35B-A3B MoE | 3B | ~19GB | Very Good | 5x faster |
+**llama.cpp**: Yes. Q4_K_M (~17GB) fits on RTX 3090 with ~7GB for context. Speed: 15-25 tok/s (vs 51 tok/s with vLLM TP=2).
 
-The 35B-A3B uses Gated DeltaNet layers (30/40) with fixed-size recurrent state instead of KV cache, enabling constant memory at any context length for those layers.
+## Hardware Comparison
+
+| Setup | 8K | 32K | 128K |
+|-------|---:|----:|-----:|
+| 2x RTX 3090 (vLLM) | 51 tok/s | 45 tok/s | 40 tok/s |
+| 1x RTX 5090 | 61 tok/s | 44 tok/s | ~35 tok/s |
+
+Dual RTX 3090 matches or beats RTX 5090 at 32K+ context.
 
 ## Troubleshooting
 
