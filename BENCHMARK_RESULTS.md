@@ -59,11 +59,14 @@ Dual RTX 3090 matches or beats single RTX 5090 at long context, at lower cost.
 ## vLLM Configuration
 
 ```bash
+pip install vllm==0.17.1  # 0.18.x has CUDA graph OOM on RTX 3090
+
 vllm serve Qwen/Qwen3.5-27B-GPTQ-Int4 \
   --tensor-parallel-size 2 \
   --max-model-len 131072 \
   --gpu-memory-utilization 0.92 \
   --kv-cache-dtype auto \
+  --disable-custom-all-reduce \
   --enable-chunked-prefill
 ```
 

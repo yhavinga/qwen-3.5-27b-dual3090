@@ -10,6 +10,7 @@ vllm serve Qwen/Qwen3.5-27B-GPTQ-Int4 \
   --max-model-len 131072 \
   --gpu-memory-utilization 0.92 \
   --kv-cache-dtype auto \
+  --disable-custom-all-reduce \
   --enable-chunked-prefill
 ```
 
