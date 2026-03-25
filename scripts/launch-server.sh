@@ -1,16 +1,17 @@
 #!/bin/bash
 # Qwen 3.5 27B GPTQ-Int4 — Dual RTX 3090 NVLink Maximum Performance
 #
-# TESTED PERFORMANCE (2026-03-21):
-#   - Peak decode: 49 tok/s (short context)
-#   - 8K context: 29 tok/s
-#   - 16K context: 20 tok/s
-#   - 32K context: 12 tok/s
+# TESTED PERFORMANCE (2026-03-25):
+#   - 8K context: 56 tok/s
+#   - 16K context: 63 tok/s
+#   - 32K context: 55 tok/s
 #
 # Requirements:
 #   - 2x RTX 3090 with NVLink bridge
-#   - vLLM 0.18.1rc1 (patched: FakeTensorMode fix + INT8 KV cache)
+#   - vLLM 0.17.1 (pip install vllm==0.17.1)
 #   - Model: Qwen/Qwen3.5-27B-GPTQ-Int4 (~17GB)
+#
+# CRITICAL: Use minimal cudagraph_capture_sizes to avoid OOM!
 
 set -e
 
@@ -44,11 +45,9 @@ fi
 exec vllm serve "Qwen/Qwen3.5-27B-GPTQ-Int4" \
     --tensor-parallel-size 2 \
     --disable-custom-all-reduce \
-    --quantization gptq_marlin \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}' \
-    --max-model-len 65536 \
+    --max-model-len 32768 \
     --gpu-memory-utilization 0.90 \
     --enable-chunked-prefill \
-    --max-num-seqs 64 \
     --port 8000 \
     "$@"

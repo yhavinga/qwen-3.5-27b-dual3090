@@ -7,42 +7,50 @@ pip install vllm==0.17.1
 
 vllm serve Qwen/Qwen3.5-27B-GPTQ-Int4 \
   --tensor-parallel-size 2 \
-  --max-model-len 131072 \
-  --gpu-memory-utilization 0.92 \
-  --kv-cache-dtype auto \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.90 \
   --disable-custom-all-reduce \
-  --enable-chunked-prefill
+  --enable-chunked-prefill \
+  --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
 ```
 
-**51 tok/s at 8K, 40 tok/s at 128K.** Only 22% degradation thanks to hybrid architecture.
+**55 tok/s at 8K-32K context.** Minimal degradation thanks to hybrid architecture.
 
-Use `--kv-cache-dtype auto` (FP16). INT8 KV cache is *slower* for hybrid models.
+**CRITICAL**: The `--compilation-config` with reduced CUDA graph sizes is essential! Default (51 sizes) causes OOM on RTX 3090.
 
 ---
 
 ## Performance Summary
 
-| Context | Decode (tok/s) | Prefill (tok/s) | Notes |
-|--------:|---------------:|----------------:|-------|
-| 8K | 51 | 1912 | Peak decode speed |
-| 32K | 45 | 1984 | Minimal degradation |
-| 64K | 39 | 1821 | |
-| 128K | 40 | 1548 | 83s TTFT |
-| 200K | ~30 | 1262 | 158s TTFT |
+| Context | TTFT | Decode (tok/s) |
+|--------:|-----:|---------------:|
+| 8K | 4s | 48 |
+| 16K | 8s | 47 |
+| 32K | 16s | 45 |
+| 64K | 35s | 43 |
+| 128K | 85s | 38 |
 
-**Key finding**: Only 22% speed degradation from 8K to 128K, thanks to hybrid architecture (25% attention + 75% GDN layers).
+**Key finding**: Only 20% decode speed degradation from 8K to 128K, thanks to hybrid architecture (25% attention + 75% GDN layers).
 
 See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for full analysis including comparison with Gemma 3 and RTX 5090.
 
-## vLLM Version
+## vLLM Version & CUDA Graph Fix
 
-**Recommended: vLLM 0.17.1**
+**Recommended: vLLM 0.17.1** with **CUDA 12.4+** (PyTorch ships with CUDA 12.4+)
 
 ```bash
 pip install vllm==0.17.1
 ```
 
-vLLM 0.18.x has a regression: CUDA graph profiling OOMs on RTX 3090 due to tight memory (model + GDN buffers = 22.5GB, only 80MB free). Use `enforce_eager=True` as workaround (4x slower).
+CUDA 12.4+ reduces CUDA graph memory by ~70% compared to older versions.
+
+**CRITICAL**: Both vLLM 0.17.1 and 0.18.x OOM during CUDA graph capture with default settings. The fix is to reduce cudagraph_capture_sizes from 51 to 6:
+
+```bash
+--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
+```
+
+Without this, the model loads (~13.9 GiB) but CUDA graph profiling needs ~800 MiB more than available.
 
 ## Quick Start
 
@@ -112,10 +120,10 @@ See [INT8_KV_CACHE_ANALYSIS.md](INT8_KV_CACHE_ANALYSIS.md) for detailed analysis
 
 | Setup | 8K | 32K | 128K |
 |-------|---:|----:|-----:|
-| 2x RTX 3090 (vLLM) | 51 tok/s | 45 tok/s | 40 tok/s |
+| 2x RTX 3090 (vLLM) | 48 tok/s | 45 tok/s | 38 tok/s |
 | 1x RTX 5090 | 61 tok/s | 44 tok/s | ~35 tok/s |
 
-Dual RTX 3090 matches or beats RTX 5090 at 32K+ context.
+Dual RTX 3090 competitive with RTX 5090, especially at long context.
 
 ## Troubleshooting
 
@@ -131,11 +139,18 @@ Dual RTX 3090 matches or beats RTX 5090 at 32K+ context.
 2. Lower GPU util: add `--gpu-memory-utilization 0.85`
 3. Enable INT8 KV cache for 50% memory savings
 
-### CUDA Graph Capture Fails
+### CUDA Graph Capture OOM
 
-Known issue with AWQ models. Use GPTQ-Int4 instead:
-- Model: `Qwen/Qwen3.5-27B-GPTQ-Int4`
-- See: https://github.com/vllm-project/vllm/issues/35743
+Default cudagraph_capture_sizes (51 entries) requires too much memory. Use minimal config:
+
+```bash
+--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
+```
+
+Or disable CUDA graphs entirely (slower):
+```bash
+--enforce-eager
+```
 
 ## Directory Structure
 
