@@ -31,13 +31,9 @@ else
 fi
 
 # ============================================================================
-# NVLink Optimization
+# GPU Selection (NCCL auto-detects NVLink)
 # ============================================================================
 export CUDA_VISIBLE_DEVICES=0,1
-export CUDA_FORCE_P2P_ACCESS=1
-export VLLM_SKIP_P2P_CHECK=1
-export NCCL_P2P_LEVEL=NVL
-export NCCL_BUFF_SIZE=16777216
 
 # ============================================================================
 # Memory Optimization

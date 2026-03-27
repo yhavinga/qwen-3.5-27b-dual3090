@@ -1,4 +1,4 @@
-# Qwen 3.5 27B — Dual RTX 3090 NVLink Maximum Performance
+# Qwen 3.5 27B — Dual RTX 3090 Optimized
 
 ## TL;DR
 
@@ -55,9 +55,6 @@ Without this, the model loads (~13.9 GiB) but CUDA graph profiling needs ~800 Mi
 ## Quick Start
 
 ```bash
-# Verify NVLink
-nvidia-smi topo -m  # Should show NV4 between GPU0 and GPU1
-
 # Test the server
 curl http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
@@ -65,21 +62,6 @@ curl http://localhost:8000/v1/completions \
 ```
 
 ## Key Optimizations
-
-### NVLink (50% Speedup)
-
-The scripts set these critical environment variables:
-```bash
-export NCCL_P2P_LEVEL=NVL        # Force NVLink path
-export CUDA_FORCE_P2P_ACCESS=1   # Enable P2P
-export VLLM_SKIP_P2P_CHECK=1     # Skip redundant checks
-```
-
-Verify NVLink is working:
-```bash
-nvidia-smi topo -m
-# Should show NV4 between GPU0 and GPU1, not PHB
-```
 
 ### CUDA Graphs (3x Decode Speedup)
 
@@ -129,9 +111,9 @@ Dual RTX 3090 competitive with RTX 5090, especially at long context.
 
 ### Low Performance (<30 tok/s)
 
-1. Check NVLink: `./scripts/check_nvlink.sh`
-2. Verify GPUs: `nvidia-smi`
-3. Check vLLM version: `pip show vllm`
+1. Verify GPUs: `nvidia-smi`
+2. Check vLLM version: `pip show vllm`
+3. Check topology: `nvidia-smi topo -m` (NV4 = NVLink, PHB = PCIe)
 
 ### OOM Errors
 
@@ -179,6 +161,5 @@ qwen3.5/
 ## References
 
 - [vLLM Optimization Docs](https://docs.vllm.ai/en/stable/configuration/optimization/)
-- [NVLink 50% Boost Benchmark](http://himeshp.blogspot.com/2025/03/vllm-performance-benchmarks-4x-rtx-3090.html)
 - [Qwen 3.5 GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-27B-GPTQ-Int4)
 - [35B-A3B 112 tok/s Analysis](https://medium.com/@CodePulse/one-rtx-3090-112-tokens-per-second-full-262k-context-no-api-bill-304f60029bb6)

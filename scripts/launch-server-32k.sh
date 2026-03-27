@@ -12,11 +12,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 export CUDA_VISIBLE_DEVICES=0,1
-export CUDA_FORCE_P2P_ACCESS=1
-export VLLM_SKIP_P2P_CHECK=1
-export NCCL_P2P_LEVEL=NVL
-export NCCL_BUFF_SIZE=16777216
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
+# Note: NCCL auto-detects NVLink — no env vars needed.
 
 if [ -d "${PROJECT_ROOT}/venv" ]; then
     source "${PROJECT_ROOT}/venv/bin/activate"
